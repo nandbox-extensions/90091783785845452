@@ -11,9 +11,7 @@ import java.io.IOException;
 import java.util.Hashtable;
 import java.util.Properties;
 
-import net.minidev.json.JSONArray;
 import net.minidev.json.JSONObject;
-import net.minidev.json.parser.JSONParser;
 
 public class ExtensionCustomLogic extends ExtensionAdapter {
 
@@ -24,7 +22,8 @@ public class ExtensionCustomLogic extends ExtensionAdapter {
     // Set your admin user id(s) here.
     private static final String[] ADMIN_USER_IDS = new String[] { "1" };
 
-    // In-memory store used when DatabaseService is not available in runtime.
+    // In-memory store fallback.
+    // Key: userId, Value: JSONObject doc
     private final Hashtable submissions = new Hashtable();
 
     public static void main(String[] args) throws Exception {
@@ -56,10 +55,39 @@ public class ExtensionCustomLogic extends ExtensionAdapter {
         this.api = api;
     }
 
-    // Fallback raw receiver: used to capture menu submissions when MenuCallback class is not present.
-    // Also handles admin chat commands via the standard IncomingMessage callback below.
+    // Menu/form submissions should be handled here, but MenuCallback class is not available in this build.
+    // Therefore we accept raw JSON fallback using onReceive(JSONObject), which is supported by ExtensionAdapter.
+    public void onMenuCallback(Object menuCallback) {
+        if (menuCallback == null) {
+            return;
+        }
+        String raw = safeToString(menuCallback);
+        if (raw == null) {
+            return;
+        }
+
+        String userId = extractBetween(raw, "\"userId\":\"", "\"");
+        if (userId == null) {
+            userId = extractBetween(raw, "\"from\":{\"id\":\"", "\"");
+        }
+        if (userId == null) {
+            userId = extractBetween(raw, "\"id\":\"", "\"");
+        }
+        if (userId == null || userId.trim().length() == 0) {
+            return;
+        }
+
+        JSONObject doc = new JSONObject();
+        doc.put("userId", userId);
+        doc.put("table", TABLE_NAME);
+        doc.put("ts", new Long(System.currentTimeMillis()));
+        doc.put("menuCallback", raw);
+        submissions.put(userId, doc);
+    }
+
     @Override
     public void onReceive(JSONObject jsonObject) {
+        // Fallback raw receiver to capture menu submissions.
         if (jsonObject == null) {
             return;
         }
@@ -68,13 +96,27 @@ public class ExtensionCustomLogic extends ExtensionAdapter {
             return;
         }
         String method = String.valueOf(methodObj);
-        if ("menuCallback".equals(method)) {
-            handleMenuCallbackJson(jsonObject);
+        if (!"menuCallback".equals(method)) {
+            return;
         }
+
+        // Store as a document keyed by userId.
+        String userId = getNestedString(jsonObject, "from", "id");
+        if (userId == null || userId.trim().length() == 0) {
+            return;
+        }
+
+        JSONObject doc = new JSONObject();
+        doc.put("userId", userId);
+        doc.put("table", TABLE_NAME);
+        doc.put("ts", new Long(System.currentTimeMillis()));
+        doc.put("payload", jsonObject);
+        submissions.put(userId, doc);
     }
 
     @Override
     public void onReceive(IncomingMessage incomingMsg) {
+        // Admin queries via chat message.
         if (incomingMsg == null) {
             return;
         }
@@ -126,27 +168,6 @@ public class ExtensionCustomLogic extends ExtensionAdapter {
             sendText(chatId, "Admin commands:\n/submits  - list all submissions\n/submit <userId> - get a user's submission", userId, chatSettings, appId);
             return;
         }
-    }
-
-    private void handleMenuCallbackJson(JSONObject jsonObject) {
-        // Expected format includes: from{id}, app_id, menu_id, current_cell_callback, cells
-        String userId = getNestedString(jsonObject, "from", "id");
-        String appId = getString(jsonObject, "app_id");
-        String menuId = getString(jsonObject, "menu_id");
-
-        if (userId == null || appId == null || menuId == null) {
-            return;
-        }
-
-        JSONObject doc = new JSONObject();
-        doc.put("userId", userId);
-        doc.put("appId", appId);
-        doc.put("menuId", menuId);
-        doc.put("current_cell_callback", getString(jsonObject, "current_cell_callback"));
-        doc.put("payload", jsonObject);
-        doc.put("ts", new Long(System.currentTimeMillis()));
-
-        submissions.put(userId, doc);
     }
 
     private String listAllSubmissions() {
@@ -206,6 +227,10 @@ public class ExtensionCustomLogic extends ExtensionAdapter {
         }
 
         Object payload = doc.get("payload");
+        if (payload == null) {
+            payload = doc.get("menuCallback");
+        }
+
         if (payload != null) {
             String payloadStr = safeToString(payload);
             if (payloadStr != null && payloadStr.length() > 3500) {
@@ -236,24 +261,17 @@ public class ExtensionCustomLogic extends ExtensionAdapter {
         api.sendText(chatId, text, reference, null, toUserId, new Integer(0), Boolean.FALSE, chatSettings, null, null, null, appId);
     }
 
-    private String getString(JSONObject obj, String key) {
-        if (obj == null || key == null) {
-            return null;
-        }
-        Object v = obj.get(key);
-        if (v == null) {
-            return null;
-        }
-        return safeToString(v);
-    }
-
     private String getNestedString(JSONObject obj, String parentKey, String childKey) {
         if (obj == null) {
             return null;
         }
         Object p = obj.get(parentKey);
         if (p instanceof JSONObject) {
-            return getString((JSONObject) p, childKey);
+            Object v = ((JSONObject) p).get(childKey);
+            if (v == null) {
+                return null;
+            }
+            return safeToString(v);
         }
         return null;
     }
@@ -309,28 +327,19 @@ public class ExtensionCustomLogic extends ExtensionAdapter {
         return arr;
     }
 
-    // JSONParser imported to satisfy platform expectation when JSON is used; used here for robustness.
-    @SuppressWarnings("unused")
-    private JSONObject parseJsonObject(String s) {
-        if (s == null) {
+    private String extractBetween(String s, String start, String end) {
+        if (s == null || start == null || end == null) {
             return null;
         }
-        try {
-            JSONParser p = new JSONParser(JSONParser.MODE_PERMISSIVE);
-            Object parsed = p.parse(s);
-            if (parsed instanceof JSONObject) {
-                return (JSONObject) parsed;
-            }
-        } catch (Throwable t) {
+        int i = s.indexOf(start);
+        if (i < 0) {
+            return null;
         }
-        return null;
-    }
-
-    @SuppressWarnings("unused")
-    private JSONArray ensureArray(Object o) {
-        if (o instanceof JSONArray) {
-            return (JSONArray) o;
+        i = i + start.length();
+        int j = s.indexOf(end, i);
+        if (j < 0) {
+            return null;
         }
-        return null;
+        return s.substring(i, j);
     }
 }
